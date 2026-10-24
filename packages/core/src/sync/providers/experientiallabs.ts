@@ -1,21 +1,23 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 
 import type { ExistingModel, SyncProvider, SyncedFullModel, SyncedModel } from "../index.js";
+import { readProviderModel } from "../../translate.js";
 import {
   factorBaseModel,
+  modelMetadata,
   resolveCanonicalBaseModel,
   resolveModelMetadataBaseModel,
 } from "./openrouter.js";
 
 // Experiential Labs exposes a public, unauthenticated model catalog, so no
 // API key is needed or used for this sync.
-const API_ENDPOINT = "https://api.experientiallabs.ai/api/models?limit=1000";
+const API_ENDPOINT = "https://api.experientiallabs.ai/api/models";
 
 // Keep this for slugs that cannot be derived from a lab filename.
-// Family prefixes, version-dot slugs, unique filenames, and deployment
-// suffixes are resolved automatically by resolveExperientiallabsBaseModel.
+// Family prefixes, version-dot slugs, and unique filenames are resolved
+// automatically by resolveExperientiallabsBaseModel.
 const CANONICAL_BASE_MODELS: Record<string, string> = {
   "grok-4.20": "xai/grok-4.20-0309-reasoning",
   "grok-4.20-non-reasoning": "xai/grok-4.20-0309-non-reasoning",
@@ -72,6 +74,7 @@ const ExperientialRung = z
   .object({
     id: z.string().optional(),
     provider: z.string().optional(),
+    billing_source: z.string(),
     input_nano_usd_per_million: z.number().nullable().optional(),
     cached_input_nano_usd_per_million: z.number().nullable().optional(),
     cache_write_input_nano_usd_per_million: z.number().nullable().optional(),
@@ -108,13 +111,16 @@ const ExperientialEntry = z
   .object({
     model: ExperientialModel,
     providers: z.array(ExperientialRung),
-    default_provider_ids: z.array(z.string()).nullable().optional(),
+    default_provider_ids: z.array(z.string()),
   })
   .passthrough();
 
 const ExperientialResponse = z
   .object({
     models: z.array(ExperientialEntry),
+    total: z.number().int().nonnegative(),
+    offset: z.number().int().nonnegative(),
+    limit: z.number().int().positive(),
   })
   .passthrough();
 
@@ -134,38 +140,33 @@ export const experientiallabs = {
   skippedNotice(ids) {
     if (ids.length === 0) return [];
     return [
-      `${ids.length} Experiential Labs models returned by the API were not created because they could not be mapped exactly to models.dev canonical metadata. `
-        + "Existing models and canonical matches are still updated from API-authoritative fields.",
+      `${ids.length} Experiential Labs models returned by the API were not created because they need canonical metadata or verified reasoning controls. `
+        + "Existing unresolved entries are preserved for manual review.",
       `Skipped slugs: ${ids.map((id) => `\`${id}\``).join(", ")}`,
     ];
   },
-  async fetchModels() {
-    const response = await fetch(API_ENDPOINT);
-    if (!response.ok) {
-      throw new Error(`Experiential Labs request failed: ${response.status} ${response.statusText}`);
-    }
-    return response.json();
-  },
+  fetchModels: fetchExperientiallabsModels,
   parseModels(raw) {
-    // Text chat models with at least one usable serving rung. Skips the Jev
-    // decisions API (a native surface, not OpenAI-compatible chat) and
-    // non-text output lanes (embeddings, image, audio, video).
-    return ExperientialResponse.parse(raw).models.filter((entry) => {
-      const model = entry.model;
-      if (model.slug.startsWith("jev-")) return false;
-      if (!(model.output_modalities ?? []).includes("text")) return false;
-      return orderedUsableRungs(entry).length > 0;
-    });
+    const data = ExperientialResponse.parse(raw);
+    const ids = data.models.map((entry) => entry.model.slug);
+    if (ids.length === 0 || ids.length !== data.total || new Set(ids).size !== ids.length) {
+      throw new Error("Experiential Labs returned an empty, incomplete, or duplicate catalog");
+    }
+    return data.models;
   },
+  missingModelID(entry) {
+    return eligible(entry) ? entry.model.slug : undefined;
+  },
+  trackMissingModels: false,
   translateModel(entry, context) {
+    if (!eligible(entry)) return undefined;
     const model = entry.model;
     const existing = context.existing(model.slug);
     const baseModel = existing?.base_model ?? resolveExperientiallabsBaseModel(model.slug, model.icon);
     // A model with no existing file and no canonical match cannot be created.
     if (existing === undefined && baseModel === undefined) return undefined;
     const built = buildExperientiallabsModel(entry, existing, baseModel);
-    // A model with no usable context window cannot produce a valid TOML
-    // (limit.context is required), so skip it rather than fail the whole sync.
+    // Keep unresolved models for manual review instead of inventing controls.
     if (built === undefined) return undefined;
     return {
       id: model.slug,
@@ -174,6 +175,31 @@ export const experientiallabs = {
     };
   },
 } satisfies SyncProvider<ExperientialEntry>;
+
+export async function fetchExperientiallabsModels(fetcher: typeof fetch = fetch) {
+  const models: ExperientialEntry[] = [];
+  let total: number | undefined;
+  while (total === undefined || models.length < total) {
+    const response = await fetcher(`${API_ENDPOINT}?limit=1000&offset=${models.length}`);
+    if (!response.ok) throw new Error(`Experiential Labs request failed: ${response.status}`);
+    const page = ExperientialResponse.parse(await response.json());
+    if (page.offset !== models.length || page.models.length === 0 || (total !== undefined && page.total !== total)) {
+      throw new Error("Experiential Labs catalog changed or returned an incomplete page; retry the sync");
+    }
+    total = page.total;
+    models.push(...page.models);
+  }
+  return { models, total, offset: 0, limit: 1000 };
+}
+
+function eligible(entry: ExperientialEntry) {
+  const rung = orderedUsableRungs(entry)[0];
+  return entry.model.status === "active"
+    && entry.model.output_modalities?.includes("text") === true
+    && rung !== undefined
+    && (rung.capabilities?.supports_tools ?? entry.model.supported_params?.tools) === true
+    && rung.capabilities?.supports_embeddings !== true;
+}
 
 type Modality = "text" | "audio" | "image" | "video" | "pdf";
 type EffortValue =
@@ -200,12 +226,7 @@ const EFFORT_VALUES: EffortValue[] = [
 // Converts nano-USD per million tokens to USD per million tokens.
 function price(value: number | null | undefined) {
   if (value === undefined || value === null) return undefined;
-  return value >= 0 ? Math.round((value / 1_000_000_000) * 1_000_000) / 1_000_000 : undefined;
-}
-
-function nonZeroPrice(value: number | null | undefined) {
-  const result = price(value);
-  return result !== undefined && result > 0 ? result : undefined;
+  return Number.isFinite(value) && value >= 0 ? value / 1_000_000_000 : undefined;
 }
 
 function modalities(values: string[] | null | undefined, fallback: Modality[]): Modality[] {
@@ -217,54 +238,23 @@ function modalities(values: string[] | null | undefined, fallback: Modality[]): 
   return [...new Set(result.length > 0 ? result : fallback)];
 }
 
-// A rung is usable when it is active, routable, and carries host-managed
-// pricing. Customer-managed rungs (e.g. BYO-key azure_openai) report null
-// prices and are excluded.
-function usableRung(rung: ExperientialRung): boolean {
-  return rung.status === "active"
-    && rung.routable !== false
-    && rung.input_nano_usd_per_million !== null
-    && rung.input_nano_usd_per_million !== undefined
-    && rung.output_nano_usd_per_million !== null
-    && rung.output_nano_usd_per_million !== undefined;
-}
-
-// Usable rungs in serving order: the default waterfall (default_provider_ids)
-// first, then any remaining usable rungs in catalog order. Pricing and
-// capabilities are read from the first rung in this order, which is the
-// rung the gateway serves by default.
+// Only the published default waterfall is callable with an Experiential key.
+// Other catalog deployments may require a customer's upstream provider key.
 function orderedUsableRungs(entry: ExperientialEntry): ExperientialRung[] {
-  const usable = entry.providers.filter(usableRung);
-  const ordered: ExperientialRung[] = [];
-  for (const id of entry.default_provider_ids ?? []) {
-    const rung = usable.find((candidate) => candidate.id === id);
-    if (rung !== undefined && !ordered.includes(rung)) ordered.push(rung);
-  }
-  for (const rung of usable) {
-    if (!ordered.includes(rung)) ordered.push(rung);
-  }
-  return ordered;
+  return entry.default_provider_ids.flatMap((id) => {
+    const rung = entry.providers.find((candidate) => candidate.id === id);
+    return rung !== undefined
+      && rung.status === "active"
+      && rung.routable === true
+      && rung.billing_source === "host_managed"
+      && price(rung.input_nano_usd_per_million) !== undefined
+      && price(rung.output_nano_usd_per_million) !== undefined
+      ? [rung] : [];
+  });
 }
 
-// Effort values reported by this model's usable serving rungs in the catalog.
-// Used ONLY to trim the lab/peer baseline down to values the gateway also
-// accepts - the gateway rung enum is never a values source by itself, and no
-// effort values are ever synthesized from it when the baseline has none.
-function unionEffortValues(rungs: ExperientialRung[]): EffortValue[] {
-  const union = new Set<string>();
-  for (const rung of rungs) {
-    for (const value of rung.capabilities?.supported_reasoning_efforts ?? []) {
-      if ((EFFORT_VALUES as string[]).includes(value)) union.add(value);
-    }
-  }
-  return EFFORT_VALUES.filter((value) => union.has(value));
-}
-
-// Reasoning controls come from the lab's first-party model definition
-// (providers/<lab>/models/<model>.toml), falling back to the canonical
-// metadata file. The lab baseline owns which controls exist (toggle, effort,
-// budget_tokens) and the wire paths for them; the gateway only narrows the
-// effort values.
+// Read per-host controls through the repository's v2 reader. Canonical lab
+// metadata deliberately has no controls and must not hide a relay peer.
 const REPO_ROOT = path.join(import.meta.dirname, "..", "..", "..", "..", "..");
 const PROVIDERS_DIR = path.join(REPO_ROOT, "providers");
 
@@ -325,41 +315,11 @@ const FIRST_PARTY_DIR_ALIASES: Record<string, string[]> = {
   "arcee-ai": ["arcee"],
 };
 
-function readCandidate(filePath: string): { text: string; parsed: unknown } | undefined {
-  let text: string;
-  try {
-    text = readFileSync(filePath, "utf8");
-  } catch {
-    return undefined;
-  }
-  try {
-    return { text, parsed: Bun.TOML.parse(text) };
-  } catch {
-    // Windows checkouts without core.symlinks materialize git symlinks as
-    // plain text files containing the link target path. Resolve such
-    // stand-ins and read the real file; on Linux readFileSync already
-    // follows the symlink, so both platforms see the same content.
-    const target = text.trim();
-    if (!/[/\\]/.test(target) || !/\.toml$/i.test(target)) return undefined;
-    const resolved = path.resolve(path.dirname(filePath), target);
-    if (!existsSync(resolved)) return undefined;
-    try {
-      const resolvedText = readFileSync(resolved, "utf8");
-      return { text: resolvedText, parsed: Bun.TOML.parse(resolvedText) };
-    } catch {
-      return undefined;
-    }
-  }
-}
-
 function readLabControls(baseModel: string, slug: string): LabControls | undefined {
   const [lab, modelID] = baseModel.split("/");
   if (lab === undefined || modelID === undefined) return undefined;
-  // Priority: the lab's first-party provider definition, then the canonical
-  // metadata file, then relay peers. Lab layers are authoritative — an
-  // explicit `reasoning_options = []` authored by the lab means "no caller
-  // control" and blocks the peer fallback; peers are only consulted when
-  // the lab layers do not state options at all.
+  // First-party controls take precedence over relay peers, including an
+  // explicit empty set. Missing controls do not mean there is no control.
   const labDirs = [...(FIRST_PARTY_DIR_ALIASES[lab] ?? []), lab].filter(
     (dir, index, all) => all.indexOf(dir) === index,
   );
@@ -385,11 +345,6 @@ function readLabControls(baseModel: string, slug: string): LabControls | undefin
       sourcePath: `providers/${dir}/models/${modelID}.toml`,
       kind: "lab" as const,
     })),
-    {
-      filePath: path.join(REPO_ROOT, "models", `${baseModel}.toml`),
-      sourcePath: `models/${baseModel}.toml`,
-      kind: "lab" as const,
-    },
     ...PEER_DIRS.flatMap((peerDir) => [
       ...peerDirs.flatMap((dir) =>
         peerFiles.map((file) => ({
@@ -409,10 +364,7 @@ function readLabControls(baseModel: string, slug: string): LabControls | undefin
   let optionsSource: LabControls | undefined;
   for (const candidate of candidates) {
     if (!existsSync(candidate.filePath)) continue;
-    const read = readCandidate(candidate.filePath);
-    if (read === undefined) continue;
-    const parsed = read.parsed;
-    const data = LabReasoning.safeParse(parsed);
+    const data = LabReasoning.safeParse(readProviderModel(candidate.filePath));
     if (!data.success) continue;
     const controls: LabControls = {
       reasoning: data.data.reasoning,
@@ -440,20 +392,23 @@ function buildCost(
   const input = price(rung.input_nano_usd_per_million);
   const output = price(rung.output_nano_usd_per_million);
   if (input === undefined || output === undefined) return existing?.cost;
-  const cacheRead = nonZeroPrice(rung.cached_input_nano_usd_per_million);
-  const cacheWrite = nonZeroPrice(rung.cache_write_input_nano_usd_per_million);
-  const reasoning = nonZeroPrice(rung.reasoning_nano_usd_per_million);
+  const cacheRead = price(rung.cached_input_nano_usd_per_million);
+  const cacheWrite = price(rung.cache_write_input_nano_usd_per_million);
+  const reasoning = price(rung.reasoning_nano_usd_per_million);
   const threshold = rung.long_context_threshold_tokens;
   const longInput = price(rung.long_context_input_nano_usd_per_million);
   const longOutput = price(rung.long_context_output_nano_usd_per_million);
-  const longCacheRead = nonZeroPrice(rung.long_context_cached_input_nano_usd_per_million);
+  const longCacheRead = price(rung.long_context_cached_input_nano_usd_per_million);
   const tiers = threshold !== undefined
       && threshold !== null
+      && Number.isInteger(threshold)
+      && threshold > 0
       && longInput !== undefined
       && longOutput !== undefined
     ? [
         {
-          tier: { type: "context" as const, size: threshold },
+          // Experiential starts the tier at >= threshold; models.dev uses >.
+          tier: { type: "context" as const, size: threshold - 1 },
           input: longInput,
           output: longOutput,
           ...(longCacheRead !== undefined ? { cache_read: longCacheRead } : {}),
@@ -485,23 +440,6 @@ function applyVersionDots(id: string) {
     .replace(/^(step-\d+)-(\d+)/, "$1.$2");
 }
 
-// Deployment lanes are stripped to reach the canonical id: context-size lanes
-// ("-24k"), version lanes ("-v1-0"), and dated lanes ("-08-2024"). Suffixes
-// that mean a DIFFERENT model (fine-tune numbers, "-batch", "-contributor")
-// are never stripped so those rows skip instead of mis-resolving.
-function stripDeploymentSuffixes(id: string) {
-  const out: string[] = [];
-  let source = id.replace(/-\d+k$/, "");
-  if (source !== id) out.push(source);
-  if (/-v\d+(-\d+)?$/.test(source)) {
-    const dropPatch = source.replace(/-\d+$/, "");
-    if (dropPatch !== source) out.push(dropPatch);
-    out.push(source.replace(/-v\d+(-\d+)?$/, ""));
-  }
-  if (/-\d{4}$/.test(source)) out.push(source.replace(/-\d{4}$/, ""));
-  return out;
-}
-
 function idVariants(id: string) {
   // "meta-llama-3-70b-instruct" resolves against models/meta by dropping the
   // brand prefix; "nous-" is carried along for the same reason.
@@ -515,9 +453,6 @@ function idVariants(id: string) {
   const variants: string[] = [];
   for (const seed of seeds) {
     if (!variants.includes(seed)) variants.push(seed);
-    for (const stripped of stripDeploymentSuffixes(seed)) {
-      if (!variants.includes(stripped)) variants.push(stripped);
-    }
   }
   return variants;
 }
@@ -572,167 +507,58 @@ export function resolveExperientiallabsBaseModel(id: string, icon?: string | nul
   return undefined;
 }
 
-// Per-family live-test evidence (2026-10-07) for dropped toggle/budget
-// controls: the Experiential Labs chat surface exposes no native on/off or
-// budget request field on any serving route. Keyed by canonical lab prefix
-// of the resolved base model.
-const FAMILY_ROUTE_EVIDENCE: Record<string, string> = {
-  anthropic:
-    "thinking_budget is rejected on the Anthropic serving route (live-tested 2026-10-07 on claude-haiku-4.5 and claude-sonnet-4.5: HTTP 400 unsupported_parameter)",
-  google:
-    "thinking_budget is rejected and enable_thinking is translated to reasoning_effort on the Google serving routes (live-tested 2026-10-07 on gemini-2.5-flash, gemini-2.5-pro and gemma-4-26b-a4b-it: HTTP 400 unsupported_parameter; on gemma-4-26b-a4b-it x-experiential-ignored-parameters [\"enable_thinking->translated(reasoning_effort)\"])",
-  alibaba:
-    "thinking_budget is rejected and enable_thinking is translated to reasoning_effort (live-tested 2026-10-07 on qwen3.5-122b-a10b and qwen3.5-27b: HTTP 400 unsupported_parameter; x-experiential-ignored-parameters [\"enable_thinking->translated(reasoning_effort)\"])",
-  deepseek:
-    "thinking_budget is rejected and thinking/enable_thinking are translated to reasoning_effort (live-tested 2026-10-07 on deepseek-v4-pro-0813: HTTP 400 unsupported_parameter; x-experiential-ignored-parameters [\"thinking->translated(reasoning_effort)\"]; the route's own error lists supported efforts low|high|max)",
-  zhipuai:
-    "thinking_budget is rejected and enable_thinking is translated to reasoning_effort (live-tested 2026-10-07 on glm-5.3-flash: HTTP 400 unsupported_parameter; x-experiential-ignored-parameters [\"enable_thinking->translated(reasoning_effort)\"])",
-  xiaomi:
-    "enable_thinking is translated to reasoning_effort (live-tested 2026-10-07 on mimo-v2.5: x-experiential-ignored-parameters [\"enable_thinking->translated(reasoning_effort)\"])",
-  moonshotai:
-    "enable_thinking is translated to reasoning_effort, and the resulting reasoning_effort is then dropped (live-tested 2026-10-07 on kimi-k2.6, single request on the azure route: x-experiential-ignored-parameters [\"enable_thinking->translated(reasoning_effort)\", \"reasoning_effort\"])",
-  minimax:
-    "enable_thinking is translated to reasoning_effort, which the MiniMax serving route rejects entirely (live-tested 2026-10-07 on minimax-m3: HTTP 400 unsupported_parameter, param reasoning_effort)",
-};
-
-// Fallback for labs whose serving routes were not directly tested: the same
-// gateway surface absorbed every on/off and budget field (rejected or
-// translated).
-const GENERAL_ROUTE_EVIDENCE =
-  "(live-tested battery 2026-10-07: thinking_budget rejected on Anthropic, Google, Qwen, DeepSeek and GLM routes; enable_thinking and thinking translated to reasoning_effort on Qwen, DeepSeek, GLM, Xiaomi, Moonshot and Google routes)";
-
+// Publish only controls verified both by the lab/peer baseline and by every
+// default serving route. Toggle/budget models need explicit host wire mappings;
+// leaving their options empty would incorrectly claim there is no caller control.
 export function buildExperientiallabsModel(
   entry: ExperientialEntry,
   existing: ExistingModel | undefined,
   baseModel = existing?.base_model ?? resolveExperientiallabsBaseModel(entry.model.slug, entry.model.icon),
-): { model: SyncedModel; header?: string } | undefined {
+): { model: SyncedModel; header: string } | undefined {
+  if (baseModel === undefined || !eligible(entry)) return undefined;
   const model = entry.model;
   const rungs = orderedUsableRungs(entry);
-  const rung = rungs[0];
-  if (rung === undefined) return undefined;
-  const params = (model.supported_params ?? {}) as Record<string, unknown>;
-  const input = modalities(model.input_modalities, ["text"]);
-  const output = modalities(model.output_modalities, ["text"]);
-  const attachment = input.some((value) => value !== "text");
-  // The lab baseline owns the reasoning flag; gateway rung hints only apply
-  // when the lab definition does not state one.
-  const lab = baseModel !== undefined ? labControls(baseModel, model.slug) : undefined;
-  const hostReasoning = rungs.some((candidate) => candidate.capabilities?.supports_reasoning === true)
-    || params.reasoning === true
-    || existing?.reasoning === true;
-  const reasoning = lab?.reasoning ?? hostReasoning;
-  const toolCall = params.tools === true || existing?.tool_call === true;
-  const structuredOutput = params.structured_outputs === true || existing?.structured_output === true;
-  const temperature = params.temperature === true || existing?.temperature === true;
-
-  // The Experiential Labs chat surface exposes exactly one verified reasoning
-  // wire: reasoning_effort (llms.txt; live-tested 2026-10-07 — enable_thinking
-  // and the DeepSeek-style thinking object are both translated to
-  // reasoning_effort, and thinking_budget is rejected on every tested serving
-  // route; per-family evidence is cited in the generated notes).
-  // Only effort controls are emitted: toggles and budget_tokens from the
-  // source are dropped with a note citing that evidence, and source wire
-  // comments are never copied because they describe the source's surface.
-  // Values come ONLY from the lab/peer baseline, trimmed to the effort values
-  // the model's serving rungs also report; when the baseline has no effort
-  // levels, nothing is synthesized from rung data - the gateway enum alone is
-  // never a values source. An explicit [] is written when nothing survives
-  // so the runner never resurrects stale options from a previous file state.
-  let reasoningOptions: SyncedModel["reasoning_options"] | undefined;
-  let header: string | undefined;
-  if (reasoning && lab?.options !== undefined && lab.options.length > 0) {
-    const hostUnion = unionEffortValues(rungs);
-    const droppedControls = lab.options.filter((option) => option.type !== "effort").length;
-    const labValues = EFFORT_VALUES.filter((value) =>
-      lab.options.some((option) => option.type === "effort" && option.values.includes(value)),
-    );
-    let values: EffortValue[] = labValues;
-    if (hostUnion.length > 0) {
-      const trimmed = labValues.filter((value) => hostUnion.includes(value));
-      if (trimmed.length > 0) values = trimmed;
-    }
+  const rung = rungs[0]!;
+  const base = modelMetadata(baseModel);
+  if (base.type !== undefined && base.type !== "chat") return undefined;
+  const lab = labControls(baseModel, model.slug);
+  const reasoning = base.reasoning === true;
+  let reasoningOptions: SyncedModel["reasoning_options"];
+  if (reasoning) {
+    if (lab?.options === undefined || lab.options.some((option) => option.type !== "effort")) return undefined;
+    const baseline = lab.options.flatMap((option) => option.type === "effort" ? option.values : []);
+    const values = EFFORT_VALUES.filter((value) => baseline.includes(value)
+      && rungs.every((route) => route.capabilities?.supported_reasoning_efforts?.includes(value)));
+    if (baseline.length > 0 && values.length === 0) return undefined;
+    // A lab with no control is only safe when the serving routes agree.
+    if (baseline.length === 0 && rungs.some((route) => (route.capabilities?.supported_reasoning_efforts?.length ?? 0) > 0)) return undefined;
     reasoningOptions = values.length > 0 ? [{ type: "effort", values }] : [];
-    const labPrefix = baseModel?.split("/")[0] ?? "";
-    const familyEvidence = FAMILY_ROUTE_EVIDENCE[labPrefix] ?? GENERAL_ROUTE_EVIDENCE;
-    const headerLines = [
-      `# Reasoning controls copied from the ${lab.sourcePath} ${lab.kind === "peer" ? "relay peer" : "lab"} baseline.`,
-    ];
-    if (values.length > 0) headerLines.push(`# Effort: reasoning_effort = ${values.join("|")}`);
-    if (droppedControls > 0) {
-      headerLines.push(
-        `# Toggle and budget controls from the source are not emitted: the Experiential Labs chat surface exposes no native on/off or budget request field - ${familyEvidence} (see platform.experientiallabs.ai/llms.txt).`,
-      );
-    }
-    if (values.length === 0) {
-      headerLines.push(
-        `# Reasoning controls: none emitted - the lab/peer baseline documents no effort levels, and its toggle/budget controls have no native request fields on this surface: ${familyEvidence}. reasoning_effort is the only reasoning wire and passes through unchanged where the route supports it (platform.experientiallabs.ai/llms.txt).`,
-      );
-    }
-    header = headerLines.join("\n") + "\n";
-  } else if (reasoning && lab?.options !== undefined && lab.options.length === 0) {
-    // The lab itself authors `reasoning_options = []` — record the provenance
-    // of the empty set instead of leaving the stamped [] unexplained.
-    header = `# Reasoning controls copied from the ${lab.sourcePath} ${lab.kind === "peer" ? "relay peer" : "lab"} baseline: it authors \`reasoning_options = []\` — no caller control is documented.\n`;
   }
-
-  const cost = buildCost(rung, existing);
-  const context = model.context_window ?? existing?.limit?.context;
-  // No usable context window: cannot build a valid model TOML, so skip.
-  if (context === undefined || context === null) return undefined;
-
-  const releaseDate = baseModel === undefined
-    ? model.release_date ?? existing?.release_date
-    : undefined;
-  const lastUpdated = baseModel === undefined
-    ? model.release_date ?? existing?.last_updated ?? releaseDate
-    : existing?.last_updated ?? releaseDate;
-  const limit = {
-    context,
-    input: model.max_input_tokens ?? existing?.limit?.input,
-    output: model.max_output_tokens ?? existing?.limit?.output,
-  };
+  const context = model.context_window;
+  const output = model.max_output_tokens;
+  if (context === undefined || context === null || context <= 0 || output === undefined || output === null || output <= 0) return undefined;
+  const limit = { context, input: model.max_input_tokens ?? undefined, output };
+  const input = modalities(model.input_modalities, ["text"]);
+  const params = model.supported_params ?? {};
   const values: Partial<SyncedFullModel> = {
     name: model.display_name ?? model.slug,
-    description: baseModel === undefined
-      ? existing?.description ?? model.description ?? undefined
-      : existing?.description,
-    family: existing?.family,
-    release_date: releaseDate,
-    last_updated: lastUpdated,
-    attachment,
+    attachment: input.some((value) => value !== "text"),
     reasoning,
     reasoning_options: reasoningOptions,
-    temperature: temperature || undefined,
-    tool_call: toolCall,
-    structured_output: structuredOutput || undefined,
-    knowledge: existing?.knowledge,
-    open_weights: existing?.open_weights,
-    status: existing?.status,
-    interleaved: existing?.interleaved,
-    cost,
+    temperature: rungs.every((route) => (route.capabilities?.supports_temperature ?? params.temperature) === true),
+    tool_call: true,
+    structured_output: rungs.every((route) => (route.capabilities?.supports_structured_output ?? params.structured_outputs) === true),
+    cost: buildCost(rung, existing),
     limit,
-    modalities: { input, output },
+    modalities: { input, output: ["text"] },
   };
-
-  if (baseModel !== undefined) {
-    return {
-      model: factorBaseModel(baseModel, values, limit, existing?.base_model_omit),
-      header,
-    };
-  }
-
-  if (existing === undefined) return undefined;
-  const required = z.object({
-    name: z.string(),
-    description: z.string(),
-    release_date: z.string(),
-    last_updated: z.string(),
-    open_weights: z.boolean(),
-    cost: z.object({ input: z.number(), output: z.number() }),
-  }).safeParse(values);
-  if (!required.success) {
-    throw new Error(`Experiential Labs model ${model.slug} has incomplete local metadata required for sync`);
-  }
-
-  return { model: values as SyncedFullModel, header };
+  const efforts = reasoningOptions?.flatMap((option) => option.type === "effort" ? option.values : []) ?? [];
+  const header = [
+    `# Source: https://api.experientiallabs.ai/api/models/${model.slug}`,
+    "# List prices in USD per million tokens; temporary promotions are excluded.",
+    ...(reasoning ? [`# Reasoning baseline: ${lab!.sourcePath}; restricted to all default serving routes.`] : []),
+    ...(efforts.length > 0 ? [`# Effort: top-level reasoning_effort = ${efforts.join("|")}.`] : []),
+    "# Host protocol: https://platform.experientiallabs.ai/docs/openai-compatibility",
+  ].join("\n") + "\n";
+  return { model: factorBaseModel(baseModel, values, limit, existing?.base_model_omit), header };
 }

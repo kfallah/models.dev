@@ -1,18 +1,23 @@
-# Reasoning controls copied from the providers/openrouter/models/tencent/hy3.toml relay peer baseline.
-# Effort: reasoning_effort = none|low|high
+# Source: https://api.experientiallabs.ai/api/models/hy3
+# List prices in USD per million tokens; temporary promotions are excluded.
+# Reasoning baseline: providers/openrouter/models/tencent/hy3.toml; restricted to all default serving routes.
+# Effort: top-level reasoning_effort = none|low|high.
+# Host protocol: https://platform.experientiallabs.ai/docs/openai-compatibility
+schema = 2
 base_model = "tencent/hy3"
+
+[capabilities]
+reasoning = { supported = true, effort = ["none", "low", "high"] }
 structured_output = true
-
-[[reasoning_options]]
-type = "effort"
-values = ["none", "low", "high"]
-
-[cost]
-input = 0.132
-output = 0.528
-cache_read = 0.033
 
 [limit]
 context = 262_144
 input = 196_608
 output = 65_536
+
+[cost.text.input]
+price = 0.132
+cache = { read = 0.033 }
+
+[cost.text.output]
+price = 0.528

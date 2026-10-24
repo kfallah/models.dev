@@ -1,18 +1,23 @@
-# Reasoning controls copied from the providers/openrouter/models/openai/gpt-5.1-codex-mini.toml relay peer baseline.
-# Effort: reasoning_effort = low|medium|high
-# Toggle and budget controls from the source are not emitted: the Experiential Labs chat surface exposes no native on/off or budget request field - (live-tested battery 2026-10-07: thinking_budget rejected on Anthropic, Google, Qwen, DeepSeek and GLM routes; enable_thinking and thinking translated to reasoning_effort on Qwen, DeepSeek, GLM, Xiaomi, Moonshot and Google routes) (see platform.experientiallabs.ai/llms.txt).
+# Source: https://api.experientiallabs.ai/api/models/gpt-5.1-codex-mini
+# List prices in USD per million tokens; temporary promotions are excluded.
+# Reasoning baseline: providers/openrouter/models/openai/gpt-5.1-codex-mini.toml; restricted to all default serving routes.
+# Effort: top-level reasoning_effort = low|medium|high.
+# Host protocol: https://platform.experientiallabs.ai/docs/openai-compatibility
+schema = 2
 base_model = "openai/gpt-5.1-codex-mini"
 name = "GPT-5.1 Codex Mini"
-attachment = false
-
-[[reasoning_options]]
-type = "effort"
-values = ["low", "medium", "high"]
-
-[cost]
-input = 0.25
-output = 2
-cache_read = 0.03
 
 [modalities]
 input = ["text"]
+output = ["text"]
+
+[capabilities]
+reasoning = { supported = true, effort = ["low", "medium", "high"] }
+structured_output = true
+
+[cost.text.input]
+price = 0.25
+cache = { read = 0.03 }
+
+[cost.text.output]
+price = 2

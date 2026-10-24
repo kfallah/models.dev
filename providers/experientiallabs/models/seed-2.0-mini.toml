@@ -1,23 +1,31 @@
-# Reasoning controls copied from the providers/openrouter/models/bytedance-seed/seed-2.0-mini.toml relay peer baseline.
-# Effort: reasoning_effort = minimal|low|medium|high
-# Toggle and budget controls from the source are not emitted: the Experiential Labs chat surface exposes no native on/off or budget request field - (live-tested battery 2026-10-07: thinking_budget rejected on Anthropic, Google, Qwen, DeepSeek and GLM routes; enable_thinking and thinking translated to reasoning_effort on Qwen, DeepSeek, GLM, Xiaomi, Moonshot and Google routes) (see platform.experientiallabs.ai/llms.txt).
+# Source: https://api.experientiallabs.ai/api/models/seed-2.0-mini
+# List prices in USD per million tokens; temporary promotions are excluded.
+# Reasoning baseline: providers/openrouter/models/bytedance-seed/seed-2.0-mini.toml; restricted to all default serving routes.
+# Effort: top-level reasoning_effort = none|minimal|low|medium|high.
+# Host protocol: https://platform.experientiallabs.ai/docs/openai-compatibility
+schema = 2
 base_model = "bytedance-seed/seed-2.0-mini"
 
-[[reasoning_options]]
-type = "effort"
-values = ["minimal", "low", "medium", "high"]
-
-[cost]
-input = 0.1
-output = 0.4
-cache_read = 0.1
-
-[[cost.tiers]]
-tier = { type = "context", size = 128_001 }
-input = 0.2
-output = 0.8
+[capabilities]
+reasoning = { supported = true, effort = ["none", "minimal", "low", "medium", "high"] }
+structured_output = true
 
 [limit]
 context = 262_144
 input = 131_072
 output = 131_072
+
+[cost.text.input]
+price = 0.1
+cache = { read = 0.1 }
+
+[[cost.text.input.overrides]]
+when = { context = { gt = 128_000 } }
+price = 0.2
+
+[cost.text.output]
+price = 0.4
+
+[[cost.text.output.overrides]]
+when = { context = { gt = 128_000 } }
+price = 0.8
